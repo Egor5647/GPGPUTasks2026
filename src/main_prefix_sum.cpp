@@ -33,13 +33,8 @@ void run(int argc, char** argv)
     //          кроме того есть debugPrintfEXT(...) для вывода в консоль с видеокарты
     //          кроме того используемая библиотека поддерживает rassert-проверки (своеобразные инварианты с уникальным числом) на видеокарте для Vulkan
 
-    ocl::KernelSource ocl_fill_with_zeros(ocl::getFillBufferWithZeros());
     ocl::KernelSource ocl_sum_reduction(ocl::getPrefixSum01Reduction());
     ocl::KernelSource ocl_prefix_accumulation(ocl::getPrefixSum02PrefixAccumulation());
-
-    avk2::KernelSource vk_fill_with_zeros(avk2::getFillBufferWithZeros());
-    avk2::KernelSource vk_sum_reduction(avk2::getPrefixSum01Reduction());
-    avk2::KernelSource vk_prefix_accumulation(avk2::getPrefixSum02PrefixAccumulation());
 
     unsigned int n = 100*1000*1000;
     std::vector<unsigned int> as(n, 0);
@@ -68,41 +63,50 @@ void run(int argc, char** argv)
     }
 
     // Аллоцируем буферы в VRAM
-    gpu::gpu_mem_32u input_gpu(n), buffer1_pow2_sum_gpu(n), buffer2_pow2_sum_gpu(n), prefix_sum_accum_gpu(n);
+    gpu::gpu_mem_32u input_gpu(n), prefix_sum_accum_gpu(n);
+    std::vector<unsigned int> level_sizes{n};
+    std::vector<gpu::gpu_mem_32u> block_sums, block_prefixes;
+    while (level_sizes.back() > SCAN_BLOCK_SIZE) {
+        const unsigned int count = (level_sizes.back() - 1) / SCAN_BLOCK_SIZE + 1;
+        level_sizes.push_back(count);
+        block_sums.emplace_back(count);
+        block_prefixes.emplace_back(count);
+    }
 
     // Прогружаем входные данные по PCI-E шине: CPU RAM -> GPU VRAM
     input_gpu.writeN(as.data(), n);
 
+    ocl_sum_reduction.precompile();
+    ocl_prefix_accumulation.precompile();
+
     // Запускаем кернел (несколько раз и с замером времени выполнения)
     std::vector<double> times;
-    for (int iter = 0; iter < 10; ++iter) {
+    for (int iter = -1; iter < 10; ++iter) {
         timer t;
 
-        // Запускаем кернел, с указанием размера рабочего пространства и передачей всех аргументов
-        // Если хотите - можете удалить ветвление здесь и оставить только тот код который соответствует вашему выбору API
-        if (context.type() == gpu::Context::TypeOpenCL) {
-            // TODO
-            throw std::runtime_error(CODE_IS_NOT_IMPLEMENTED);
-            // ocl_fill_with_zeros.exec();
-            // ocl_sum_reduction.exec();
-            // ocl_prefix_accumulation.exec();
-        } else if (context.type() == gpu::Context::TypeCUDA) {
-            // TODO
-            throw std::runtime_error(CODE_IS_NOT_IMPLEMENTED);
-            // cuda::fill_buffer_with_zeros();
-            // cuda::prefix_sum_01_reduction();
-            // cuda::prefix_sum_02_prefix_accumulation();
-        } else if (context.type() == gpu::Context::TypeVulkan) {
-            // TODO
-            throw std::runtime_error(CODE_IS_NOT_IMPLEMENTED);
-            // vk_fill_with_zeros.exec();
-            // vk_sum_reduction.exec();
-            // vk_prefix_accumulation.exec();
-        } else {
-            rassert(false, 4531412341, context.type());
+        // Сначала считаем только суммы блоков: большой промежуточный массив не записывается.
+        for (size_t level = 0; level < block_sums.size(); ++level) {
+            const auto& input = level == 0 ? input_gpu : block_sums[level - 1];
+            gpu::WorkSize ws(SCAN_GROUP_SIZE, size_t(level_sizes[level + 1]) * SCAN_GROUP_SIZE);
+            ocl_sum_reduction.execAsynchronized(ws, input, block_sums[level], level_sizes[level]);
         }
 
-        times.push_back(t.elapsed());
+        // Сканируем сверху вниз. Поправка блока уже известна при единственной записи его выхода.
+        if (n > 0) {
+            for (size_t remaining = level_sizes.size(); remaining > 0; --remaining) {
+                const size_t level = remaining - 1;
+                const auto& input = level == 0 ? input_gpu : block_sums[level - 1];
+                auto& output = level == 0 ? prefix_sum_accum_gpu : block_prefixes[level - 1];
+                const auto& offsets = level < block_prefixes.size() ? block_prefixes[level] : input;
+                const size_t groups = (level_sizes[level] - 1) / SCAN_BLOCK_SIZE + 1;
+                gpu::WorkSize ws(SCAN_GROUP_SIZE, groups * SCAN_GROUP_SIZE);
+                ocl_prefix_accumulation.execAsynchronized(ws, input, offsets, output, level_sizes[level]);
+            }
+            OCL_SAFE_CALL(clFinish(context.cl()->queue()));
+        }
+
+        if (iter >= 0)
+            times.push_back(t.elapsed());
     }
     std::cout << "prefix sum times (in seconds) - " << stats::valuesStatsLine(times) << std::endl;
 

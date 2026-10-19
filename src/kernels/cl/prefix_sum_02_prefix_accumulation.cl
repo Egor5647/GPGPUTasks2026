@@ -5,14 +5,67 @@
 #include "helpers/rassert.cl"
 #include "../defines.h"
 
-__attribute__((reqd_work_group_size(1, 1, 1)))
+__attribute__((reqd_work_group_size(SCAN_GROUP_SIZE, 1, 1)))
 __kernel void prefix_sum_02_prefix_accumulation(
-    // это лишь шаблон! смело меняйте аргументы и используемые буфера! можете сделать даже больше кернелов, если это вызовет затруднения - смело спрашивайте в чате
-    // НЕ ПОДСТРАИВАЙТЕСЬ ПОД СИСТЕМУ! СВЕРНИТЕ С РЕЛЬС!! БУНТ!!! АНТИХАЙП!11!!1
-    __global const uint* pow2_sum, // pow2_sum[i] = sum[i*2^pow2; (i+1)*2^pow2)
-    __global       uint* prefix_sum_accum, // we want to make it finally so that prefix_sum_accum[i] = sum[0, i]
-    unsigned int n,
-    unsigned int pow2)
+    __global const uint* input,
+    __global const uint* block_prefix,
+    __global uint* output,
+    unsigned int n)
 {
-    // TODO
+    const uint lid = get_local_id(0);
+    const size_t group = get_group_id(0);
+    const size_t base = group * SCAN_BLOCK_SIZE + lid * SCAN_ITEMS_PER_THREAD;
+    uint values[SCAN_ITEMS_PER_THREAD];
+    if (base + SCAN_ITEMS_PER_THREAD <= n) {
+        vstore16(vload16(0, input + base), 0, values);
+    } else {
+        #pragma unroll
+        for (uint j = 0; j < SCAN_ITEMS_PER_THREAD; ++j)
+            values[j] = base + j < n ? input[base + j] : 0;
+    }
+
+    uint sum = 0;
+    #pragma unroll
+    for (uint j = 0; j < SCAN_ITEMS_PER_THREAD; ++j) {
+        sum += values[j];
+        values[j] = sum;
+    }
+
+    // Blelloch exclusive scan of the per-thread totals.
+    __local uint sums[SCAN_GROUP_SIZE];
+    sums[lid] = sum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (uint stride = 1; stride < SCAN_GROUP_SIZE; stride *= 2) {
+        const uint right = (lid + 1) * 2 * stride - 1;
+        if (right < SCAN_GROUP_SIZE)
+            sums[right] += sums[right - stride];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (lid == 0)
+        sums[SCAN_GROUP_SIZE - 1] = 0;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (uint stride = SCAN_GROUP_SIZE / 2; stride > 0; stride /= 2) {
+        const uint right = (lid + 1) * 2 * stride - 1;
+        if (right < SCAN_GROUP_SIZE) {
+            const uint left_sum = sums[right - stride];
+            sums[right - stride] = sums[right];
+            sums[right] += left_sum;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    const uint offset = sums[lid] + (group == 0 ? 0 : block_prefix[group - 1]);
+    #pragma unroll
+    for (uint j = 0; j < SCAN_ITEMS_PER_THREAD; ++j)
+        values[j] += offset;
+
+    if (base + SCAN_ITEMS_PER_THREAD <= n) {
+        vstore16(vload16(0, values), 0, output + base);
+    } else {
+        #pragma unroll
+        for (uint j = 0; j < SCAN_ITEMS_PER_THREAD; ++j) {
+            if (base + j < n)
+                output[base + j] = values[j];
+        }
+    }
 }
